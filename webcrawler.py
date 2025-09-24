@@ -17,12 +17,6 @@ UA = "azw7225@nyu.edu"
 
 logger = logging.getLogger(__name__)
 
-successLogger = logging.getLogger("successLogger")
-successLogger.setLevel(logging.INFO)
-fh1 = logging.FileHandler("successLogs.log")
-successLogger.addHandler(fh1)
-successLogger.propagate = False  # don’t duplicate to root
-
 domains = defaultdict(int)
 suffix = defaultdict(int)
 bloomFilter = Bloom(1_000_000, 0.1)
@@ -41,32 +35,62 @@ DISALLOWED_EXTENSIONS = {
     ".yaml", ".yml"
 }
 
+parseLock = threading.Lock()
+numParsed = 0
+notFoundLock = threading.Lock()
+num404 = 0
+otherErrorLock = threading.Lock()
+otherErrors = 0
+
+calcLock = threading.Lock()
+
+TARGET_TOTAL = 10000
+STOP = threading.Event()
+
+def total_processed():
+    with parseLock:
+        p = numParsed
+    with notFoundLock:
+        n = num404
+    with otherErrorLock:
+        o = otherErrors
+    return p + n + o
+
 class HTMLLinkParser(HTMLParser):
     def __init__(self, baseLink, depth):
         super().__init__()
         self.baseLink = baseLink
         self.depth = depth
+        self.timeout = time.time() + 1
 
     def handle_starttag(self, tag, attrs):
+        if time.time() > self.timeout:
+            raise TimeoutError()
         attrs = dict(attrs)
         if tag == "base":
             newBase = attrs.get("href")
-            if newBase: self.baseLink = newBase
+            if newBase: self.baseLink = urljoin(self.baseLink, newBase)
         if tag == "a" or tag == "area" or tag == "link":
             newLink = attrs.get("href")
             if not newLink:
                 return
+            anchorIndex = newLink.find("#")
+            if anchorIndex != -1:
+                newLink = newLink[:anchorIndex]
+            queryIndex = newLink.find("?")
+            if queryIndex != -1:
+                newLink = newLink[:queryIndex]
+
             if validNewLink(newLink):    
-                parseLink(urljoin(self.baseLink, newLink), self.baseLink, self.depth)
+                parseLink(urljoin(self.baseLink, newLink), self.depth)
             
         
-
 class HTTPRedirectHandler(urllib.request.HTTPRedirectHandler):
     def __init__(self):
         super().__init__()
 
     def redirect_request(self, req, fp, code, msg, hdrs, newurl):
-        logger.debug("REDIRECT: {req.full_url} to {newurl}")
+        # logger.debug(f"REDIRECT: {req.full_url} to {newurl}")
         newurl = urljoin(req.full_url, newurl)
         new_req = super().redirect_request(req, fp, code, msg, hdrs, newurl)
         if new_req:
@@ -82,7 +106,10 @@ _opener = urllib.request.build_opener(
 _opener.addheaders = [("User-Agent", UA)]
 urllib.request.install_opener(_opener)
 
-def canParseRobot(link: str, baseLink: str) -> bool:
+def canParseRobot(link: str) -> bool:
+    parsed = urlparse(link)
+    baseLink = parsed.scheme + "://" + parsed.netloc
+
     rp = rp_cache.get(baseLink)
 
     if not rp:
@@ -92,7 +119,8 @@ def canParseRobot(link: str, baseLink: str) -> bool:
         try:
             rp.read()
         except Exception as e:
-            logger.warning(f"robots.txt fetch failed for {baseLink}: {e}")
+            # logger.warning(f"robots.txt fetch failed for {baseLink}: {e}")
+            pass
 
         rp_cache[baseLink] = rp
 
@@ -102,59 +130,83 @@ def validNewLink(link: str) -> bool:
     if link.find("cgi") != -1:
         return False
     
-    possibleFile = link.split("/")[-1].rfind(".")
-    extension = link.split("/")[-1][possibleFile:]
-    if possibleFile != -1 and extension in DISALLOWED_EXTENSIONS:
-        logger.info(f"DISALLOWED EXTENSION FOUND: {link}")
+    possibleFile = urlparse(link).path.rsplit("/", 1)[-1]
+    extensionDot = possibleFile.rfind(".")
+    if extensionDot != -1 and possibleFile[extensionDot:].lower() in DISALLOWED_EXTENSIONS:
         return False
     return True
         
-def parseLink(link: str, baseLink: str, depth: int) -> bool:
-    logger.info(f"Parsing link {link}")
+def parseLink(link: str, depth: int) -> bool:
     extract = tldextract.extract(link)
     
-    if not canParseRobot(link, baseLink):
-        logger.info("Not allowed to parse by robot.txt, exiting early")
-        return False
-    
+    if not canParseRobot(link):
+        return False  
     if link in bloomFilter: 
-        logger.info("Link in bloom filter, exiting early")
         return False
 
     bloomFilter.add(link)
-
-    priority = (1 / math.log1p(domains[extract.domain] + 1)) + 5 * (1 / math.log1p(domains[extract.suffix] + 1))
-    logger.info(f"Priority {priority}, domain {extract.domain} : {domains[extract.domain]}, suffix {extract.suffix} : {suffix[extract.suffix]}")
-    domains[extract.domain] += 1
-    suffix[extract.suffix] += 1
-
+    
+    priority = (1 / math.log1p(domains[extract.domain] + 1)) + 5 * (1 / math.log1p(suffix[extract.suffix] + 1))
     queue.put((-priority, depth+1, link))
+
     return True
 
 def worker():
+    global numParsed, num404, otherErrors
     # while True:
-    for _ in range(100):
-        priority, depth, linkToParse = queue.get()
+    while not STOP.is_set():
+        linkToParse = ""
+        extract = None
+        priority = 0
+
+        while True:
+            priority, depth, linkToParse = queue.get()
+            extract = tldextract.extract(linkToParse)
+            with calcLock:
+                updatedPriority = (1 / math.log1p(domains[extract.domain] + 1)) + 5 * (1 / math.log1p(suffix[extract.suffix] + 1))
+            if updatedPriority == priority * -1:
+                break
+            queue.put((-updatedPriority, depth, linkToParse))
+
+        with calcLock:
+            domains[extract.domain] += 1
+            suffix[extract.suffix] += 1
+
         request = urllib.request.Request(linkToParse, headers={"User-Agent": UA})
         parsedLink = urlparse(linkToParse)
         base = parsedLink.scheme + "://" + parsedLink.netloc
 
         try: 
-            with urllib.request.urlopen(request, timeout=5) as response:
+            with urllib.request.urlopen(request, timeout=1) as response:
                 timeAccessed = time.localtime()
-                if response.headers['Content-Type'].split(";")[0] != "text/html":
+                if response.headers.get_content_type() != "text/html":
                     continue
                 parser = HTMLLinkParser(base, depth)
                 charset = response.headers.get_content_charset()
-                parser.feed(response.read().decode(charset if charset else "utf-8", errors="replace"))
-                successLogger.info(f"{linkToParse} successfully parsed: \nTime Accessed: {time.strftime("%H:%M:%S", timeAccessed)}, Priority: {priority}, Depth: {depth}, Return Code: {response.getcode()}")
-        except HTTPError as e:
-            logger.info(f"HTTPError {e.code} for {linkToParse}; skipping")
-        except UnicodeEncodeError:
-            logger.info(f"Dropping non-ASCII URL that cannot be encoded: {linkToParse}")
-        except Exception as e:
-            logger.exception(f"Unexpected error for {linkToParse}: {e}")
+                try: 
+                    parser.feed(response.read().decode(charset if charset else "utf-8", errors="replace"))
+                except TimeoutError:
+                    pass
+                logger.info(f"{linkToParse} successfully parsed: \nTime Accessed: {time.strftime('%H:%M:%S', timeAccessed)}, Priority: {priority}, Depth: {depth}, Return Code: {response.getcode()}, Domain: {domains[extract.domain]}, Suffix: {suffix[extract.suffix]}")
+                with parseLock:
+                    numParsed += 1
 
+        except HTTPError as e:
+            timeAccessed = time.localtime()    
+            logger.info(f"{linkToParse} unsuccessfully parsed: \nTime Accessed: {time.strftime('%H:%M:%S', timeAccessed)}, Priority: {priority}, Depth: {depth}, Return Code: {e.code}")
+            if e.code == 404:
+                with notFoundLock:
+                    num404 += 1
+            else:
+                with otherErrorLock:
+                    otherErrors += 1
+        except UnicodeEncodeError:
+            pass
+        except Exception as e:
+            pass
+
+        if total_processed() >= TARGET_TOTAL:
+            STOP.set()
 
 def main():
     logging.basicConfig(filename='webcrawler.log', level=logging.INFO)
@@ -167,21 +219,22 @@ def main():
     with DDGS() as ddgs:
         results = ddgs.text(searchTerm, max_results=3)
         for r in results:
-            parsedLink = urlparse(r["href"])
-            base = parsedLink.scheme + "://" + parsedLink.netloc
-            parseLink(r["href"], base, -1)
+            parseLink(r["href"], -1)
 
-    threads = []
-    for _ in range(25):
-        t = threading.Thread(target=worker)
-        t.start()
-        threads.append(t)
+    startTime = time.time()
+    for _ in range(40):
+        threading.Thread(target=worker, daemon=True).start()
 
-    for i in range(25):
-        threads[i].join()
+    try:
+        while not STOP.is_set():
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        STOP.set()
 
-    print(queue.qsize())
-    
+    endTime = time.time()
+    time.sleep(10)
+
+    logger.info(f"CRAWL COMPLETE: Time Taken: {endTime - startTime}, Num Parsed: {numParsed}, Num 404: {num404}, Other Codes: {otherErrors}")
 
 if __name__ == '__main__':
     main()
